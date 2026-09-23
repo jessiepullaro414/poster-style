@@ -35,12 +35,13 @@ CONTROLNETS = {
 
 DEFAULT_PROMPT = (
     "flat editorial illustration, minimalist vector art style, smooth cel shading, "
-    "clean flat color shapes, muted pastel palette, soft ambient lighting, matte finish, "
+    "clean flat color shapes, muted pastel palette, soft even daylight, matte finish, "
     "subtle canvas texture, modern poster art, crisp linework"
 )
 DEFAULT_NEGATIVE = (
     "photograph, photorealistic, 3d render, hdr, film grain, noise, jpeg artifacts, "
-    "harsh specular highlights, oversaturated, text, watermark, signature, blurry, "
+    "dark background, black foliage, night, dim, dense dark forest, harsh shadow, "
+    "high contrast, harsh specular highlights, oversaturated, text, watermark, signature, blurry, "
     "deformed, wrong proportions, extra wheels, extra lights"
 )
 
@@ -161,14 +162,17 @@ def build_parser():
 
     p.add_argument("--control", choices=["lineart", "canny", "none"], default="lineart",
                    help="how to lock geometry (default: lineart)")
-    p.add_argument("--control-scale", type=float, default=0.75,
-                   help="ControlNet strength 0..1.5 (higher = more faithful outline)")
-    p.add_argument("--strength", type=float, default=0.9,
+    p.add_argument("--control-scale", type=float, default=0.65,
+                   help="ControlNet strength 0..1.5 (higher = more faithful outline, but "
+                        "also drags dark/shadowed regions from the source photo's "
+                        "linework straight into the output -- lower it if the "
+                        "background comes out too dark/forest-like)")
+    p.add_argument("--strength", type=float, default=0.95,
                    help="img2img denoising 0..1 (higher = more restyled, less faithful). "
                         "Below ~0.8 SD1.5 barely restyles a photo -- it just denoises "
                         "back toward the original.")
     p.add_argument("--steps", type=int, default=28)
-    p.add_argument("--guidance", type=float, default=8.0)
+    p.add_argument("--guidance", type=float, default=7.5)
     p.add_argument("--max-size", type=int, default=768, help="long edge in pixels")
     p.add_argument("--seed", type=int, default=-1, help="-1 = random per image")
 
