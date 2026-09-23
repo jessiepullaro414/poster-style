@@ -28,6 +28,7 @@ import sys
 # Keep the multi-GB model cache next to this script unless the user says otherwise.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("HF_HOME", os.path.join(_HERE, "models"))
+sys.path.insert(0, _HERE)  # so `from posterize import grade` finds its sibling script
 
 import numpy as np
 import torch
@@ -91,6 +92,19 @@ def load_style_image(path):
     img = Image.open(path).convert("RGBA")
     bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
     return Image.alpha_composite(bg, img).convert("RGB")
+
+
+def apply_pastel(pil_img):
+    """Post-process color grade toward a soft/pastel palette -- the model's own
+    color choices tend to run more saturated than a poster illustration wants.
+    Reuses posterize.py's grade() (saturation down, blacks lifted, slight warm
+    tint) rather than re-rolling generations to chase color taste."""
+    import cv2
+    from posterize import grade
+
+    bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    graded = grade(bgr, saturation=0.62, warmth=0.05, lift=0.13, gamma=0.97, contrast=0.9)
+    return Image.fromarray(cv2.cvtColor(graded, cv2.COLOR_BGR2RGB))
 
 
 def _smooth_for_edges(img):
@@ -287,6 +301,13 @@ def build_parser():
                         "vs. the text prompt (default 0.6)")
     p.add_argument("--seed", type=int, default=-1, help="-1 = random per image")
 
+    p.add_argument("--pastel", action="store_true",
+                   help="post-process color grade toward a softer/muted palette "
+                        "(saturation down, blacks lifted, slight warm tint) -- "
+                        "generated colors tend to run more saturated than a "
+                        "poster wants; this is cheap/deterministic vs. re-rolling "
+                        "seeds to chase color taste")
+
     p.add_argument("--prompt", default=DEFAULT_PROMPT)
     p.add_argument("--negative", default=DEFAULT_NEGATIVE)
     p.add_argument("--extra-prompt", default="",
@@ -353,6 +374,8 @@ def main():
         img = load_resized(src, args.max_size)
         print(f"{src}  {img.size}  seed={seed}", flush=True)
         result = run_one(pipe, img, args.control, args, seed, style_image=style_image)
+        if args.pastel:
+            result = apply_pastel(result)
         os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
         result.save(dst)
         print(f"  -> {dst}", flush=True)
