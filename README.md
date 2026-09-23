@@ -49,6 +49,8 @@ Then build the venv (adjust the path uv printed for your 3.13 install):
 # for current cu12x tag + compatible torchvision version if these have moved on):
 ./.venv/Scripts/python.exe -m pip install torch==2.9.1 torchvision==0.24.1 --index-url https://download.pytorch.org/whl/cu128
 ./.venv/Scripts/python.exe -m pip install diffusers transformers accelerate safetensors numpy pillow opencv-python controlnet_aux
+# optional, only needed for --remove-bg:
+./.venv/Scripts/python.exe -m pip install rembg onnxruntime
 ```
 
 **Gotcha:** installing the second line (diffusers etc.) with no `--index-url` can
@@ -99,3 +101,28 @@ Key knobs (all in the module docstring / `--help`):
   (`--strength`, `--control-scale`, `--extra-prompt`, `--seed`) works the same
   way; `--control`, `--max-size`, `--steps`, and `--guidance` get sdxl-specific
   defaults automatically unless you pass them explicitly.
+- `--remove-bg` -- cut the subject out (rembg, local/free) and flatten onto
+  white before generating. Gets rid of a busy real-world background *and*
+  its cast shadow, which ControlNet otherwise carries straight into the
+  output as if they were part of the subject. Needs `rembg`/`onnxruntime`
+  (see setup above); first use downloads a ~1GB segmentation model.
+- `--pastel` -- post-process color grade toward a softer palette (reuses
+  `posterize.py`'s `grade()`). Generated colors tend to run more saturated
+  than a poster wants; cheaper and more predictable than re-rolling seeds to
+  chase color taste.
+- `--style-image` (IP-Adapter, condition directly on a reference image
+  instead of describing it in words) is wired up but **currently broken** in
+  this venv -- a diffusers 0.40.0 / transformers 5.x incompatibility with no
+  fix available as of diffusers' latest release. Fails fast with an
+  explanation rather than burning GPU time. See the comment above the check
+  in `illustrate.py` if revisiting this later.
+
+### What actually worked, end to end
+
+For the reference photo this was built against, the combination that landed
+closest to a hand-drawn poster: `--remove-bg` (kills the real cast shadow and
+busy lawn/driveway background) + SD1.5 (flatter than SDXL, which kept pulling
+back toward photoreal) + `--pastel` (SD1.5's raw color choices ran punchier
+than a poster wants) + a specific `--extra-prompt` describing the subject's
+actual colors and details + a seed that happened to land on the right wheel
+color (`--seed 23` here -- there's no shortcut for this part, roll a few).

@@ -75,9 +75,30 @@ DEFAULT_NEGATIVE = (
 # --------------------------------------------------------------------------- #
 # image helpers
 # --------------------------------------------------------------------------- #
-def load_resized(path, max_size):
-    """Open RGB and scale so the long edge == max_size, both edges multiples of 8."""
+def _flatten_onto_white(img):
+    """RGBA -> RGB, compositing transparency onto white. A transparent pixel's
+    RGB is otherwise undefined and can come back black, which would poison
+    whatever reads it next (a CLIP embedding, an edge detector)."""
+    img = img.convert("RGBA")
+    bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
+    return Image.alpha_composite(bg, img).convert("RGB")
+
+
+def cut_out_subject(img):
+    """Remove the background (rembg, local/free) and flatten onto white. Also
+    strips whatever real-world cast shadow was in the photo -- it's part of
+    the background, not the subject, so it goes with it."""
+    from rembg import remove
+
+    return _flatten_onto_white(remove(img))
+
+
+def load_resized(path, max_size, remove_bg=False):
+    """Open RGB (optionally background-removed) and scale so the long edge ==
+    max_size, both edges multiples of 8."""
     img = Image.open(path).convert("RGB")
+    if remove_bg:
+        img = cut_out_subject(img)
     w, h = img.size
     scale = max_size / max(w, h)
     nw, nh = (max(64, round(w * scale)), max(64, round(h * scale)))
@@ -86,12 +107,8 @@ def load_resized(path, max_size):
 
 
 def load_style_image(path):
-    """Open a reference image for IP-Adapter -- flatten transparency onto white
-    first (a background-removed PNG's RGB under a transparent pixel is
-    undefined and can come back black, which would poison the CLIP embedding)."""
-    img = Image.open(path).convert("RGBA")
-    bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
-    return Image.alpha_composite(bg, img).convert("RGB")
+    """Open a reference image for IP-Adapter, flattened onto white."""
+    return _flatten_onto_white(Image.open(path))
 
 
 def apply_pastel(pil_img):
@@ -290,6 +307,14 @@ def build_parser():
     p.add_argument("--max-size", type=int, default=None,
                    help="long edge in pixels (default: 768 for sd15, 1024 for sdxl)")
 
+    p.add_argument("--remove-bg", action="store_true",
+                   help="cut the subject out (rembg, local/free) and flatten onto "
+                        "white before generating -- gets rid of a busy real-world "
+                        "background *and* its cast shadow, which img2img/ControlNet "
+                        "otherwise carry into the output. Also appends 'plain simple "
+                        "flat background, minimal soft shadow' to the prompt so the "
+                        "model doesn't try to reconstruct a photoreal scene.")
+
     p.add_argument("--style-image",
                    help="reference image (IP-Adapter) whose look gets blended in on "
                         "top of the text prompt -- much stronger pull toward matching "
@@ -323,6 +348,8 @@ def main():
         os.environ["HF_HOME"] = args.hf_home
     if args.extra_prompt:
         args.prompt = f"{args.prompt}, {args.extra_prompt}"
+    if args.remove_bg:
+        args.prompt = f"{args.prompt}, plain simple flat background, minimal soft shadow"
 
     # per-model defaults for the knobs left unset on the command line
     if args.control is None:
@@ -371,7 +398,7 @@ def main():
             print(f"skip (missing): {src}", file=sys.stderr)
             continue
         seed = torch.seed() % (2**31) if args.seed < 0 else args.seed
-        img = load_resized(src, args.max_size)
+        img = load_resized(src, args.max_size, remove_bg=args.remove_bg)
         print(f"{src}  {img.size}  seed={seed}", flush=True)
         result = run_one(pipe, img, args.control, args, seed, style_image=style_image)
         if args.pastel:
