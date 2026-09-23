@@ -1,0 +1,10 @@
+# local Python runtime + venv (installed by setup, not checked in)
+.venv/
+.uv-python/
+
+# HuggingFace model cache (~6 GB, downloaded on first illustrate.py run)
+models/
+
+# scratch test images
+sample_in.png
+sample_out.png
