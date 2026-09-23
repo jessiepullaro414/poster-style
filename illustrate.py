@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
 """Repaint a photo as a flat editorial illustration -- fully local, no API, no cost.
 
-Stable Diffusion 1.5 img2img with a ControlNet (lineart or canny) so the subject's
-geometry survives while the surface style is redrawn into flat shapes and cel
-shading.  The first run downloads ~6 GB of open weights from HuggingFace into
+img2img with a ControlNet (lineart or canny) so the subject's geometry survives
+while the surface style is redrawn into flat shapes and cel shading. Two models:
+
+- sd15 (default): fast (~10s/image on an 8GB GPU), lineart or canny, ~5GB VRAM.
+- sdxl: sharper detail and colour, closer to a hand-drawn poster, canny only
+  here. Doesn't fit an 8GB card at its native 1024px even with attention
+  slicing, so it runs under CPU-offload -- ~10-12 minutes/image on an RTX
+  3070 Ti. Drop --max-size (e.g. 768) to trade resolution for speed.
+
+First run of a given model downloads its weights from HuggingFace into
 ./models (override with --hf-home or the HF_HOME env var); no account needed.
 
     python illustrate.py photo.jpg -o out.png
-    python illustrate.py photo.jpg -o out.png --strength 0.7 --control lineart --seed 3
+    python illustrate.py photo.jpg -o out.png --model sdxl --seed 3
     python illustrate.py *.jpg --outdir out --suffix _art
 
 Run inside poster-style/.venv (see the project setup notes).
@@ -27,11 +34,23 @@ import torch
 from PIL import Image
 
 
-BASE_MODEL = "stable-diffusion-v1-5/stable-diffusion-v1-5"
-CONTROLNETS = {
-    "lineart": "lllyasviel/control_v11p_sd15_lineart",
-    "canny": "lllyasviel/control_v11p_sd15_canny",
+BASE_MODELS = {
+    "sd15": "stable-diffusion-v1-5/stable-diffusion-v1-5",
+    "sdxl": "stabilityai/stable-diffusion-xl-base-1.0",
 }
+CONTROLNETS = {
+    "sd15": {
+        "lineart": "lllyasviel/control_v11p_sd15_lineart",
+        "canny": "lllyasviel/control_v11p_sd15_canny",
+    },
+    "sdxl": {
+        # diffusers' official SDXL canny checkpoint; there's no equally
+        # well-supported single-purpose SDXL lineart checkpoint yet, so
+        # --control lineart is sd15-only for now.
+        "canny": "diffusers/controlnet-canny-sdxl-1.0",
+    },
+}
+SDXL_VAE_FIX = "madebyollin/sdxl-vae-fp16-fix"  # avoids NaN/black frames in fp16
 
 DEFAULT_PROMPT = (
     "flat editorial illustration, minimalist vector art style, smooth cel shading, "
@@ -82,36 +101,62 @@ def make_control_image(img, kind):
 # --------------------------------------------------------------------------- #
 # pipeline
 # --------------------------------------------------------------------------- #
-def build_pipeline(control_kind):
-    from diffusers import (
-        ControlNetModel,
-        StableDiffusionControlNetImg2ImgPipeline,
-        StableDiffusionImg2ImgPipeline,
-        UniPCMultistepScheduler,
-    )
+def build_pipeline(model, control_kind):
+    import diffusers
+
+    if control_kind != "none" and control_kind not in CONTROLNETS[model]:
+        sys.exit(
+            f"--control {control_kind} isn't wired up for --model {model} "
+            f"(available: {', '.join(CONTROLNETS[model])}, or 'none')"
+        )
 
     cuda = torch.cuda.is_available()
     dtype = torch.float16 if cuda else torch.float32
+    base = BASE_MODELS[model]
+    variant = "fp16" if (cuda and model == "sdxl") else None
 
-    if control_kind == "none":
-        pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
-            BASE_MODEL, torch_dtype=dtype, safety_checker=None
-        )
+    if model == "sdxl":
+        vae = diffusers.AutoencoderKL.from_pretrained(SDXL_VAE_FIX, torch_dtype=dtype)
+        if control_kind == "none":
+            pipe = diffusers.StableDiffusionXLImg2ImgPipeline.from_pretrained(
+                base, vae=vae, torch_dtype=dtype, variant=variant, use_safetensors=True
+            )
+        else:
+            controlnet = diffusers.ControlNetModel.from_pretrained(
+                CONTROLNETS[model][control_kind], torch_dtype=dtype
+            )
+            pipe = diffusers.StableDiffusionXLControlNetImg2ImgPipeline.from_pretrained(
+                base, controlnet=controlnet, vae=vae, torch_dtype=dtype,
+                variant=variant, use_safetensors=True,
+            )
     else:
-        controlnet = ControlNetModel.from_pretrained(
-            CONTROLNETS[control_kind], torch_dtype=dtype
-        )
-        pipe = StableDiffusionControlNetImg2ImgPipeline.from_pretrained(
-            BASE_MODEL, controlnet=controlnet, torch_dtype=dtype, safety_checker=None
-        )
+        if control_kind == "none":
+            pipe = diffusers.StableDiffusionImg2ImgPipeline.from_pretrained(
+                base, torch_dtype=dtype, safety_checker=None
+            )
+        else:
+            controlnet = diffusers.ControlNetModel.from_pretrained(
+                CONTROLNETS[model][control_kind], torch_dtype=dtype
+            )
+            pipe = diffusers.StableDiffusionControlNetImg2ImgPipeline.from_pretrained(
+                base, controlnet=controlnet, torch_dtype=dtype, safety_checker=None
+            )
 
-    pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
+    pipe.scheduler = diffusers.UniPCMultistepScheduler.from_config(pipe.scheduler.config)
     if cuda:
-        pipe.to("cuda")
         if hasattr(pipe, "enable_attention_slicing"):
             pipe.enable_attention_slicing()
         if hasattr(pipe, "enable_vae_tiling"):
             pipe.enable_vae_tiling()
+        if model == "sdxl":
+            # SDXL + a ControlNet doesn't fit an 8GB card at 1024px. Calling
+            # plain .to("cuda") doesn't even raise OOM on Windows -- WDDM
+            # silently spills the overflow into slow shared system memory,
+            # which measured *slower* than explicit offload (~16 vs ~12
+            # min/image, same output, tested back to back). Offload it is.
+            pipe.enable_model_cpu_offload()
+        else:
+            pipe.to("cuda")
     else:
         print("no CUDA -- running on CPU, expect minutes per image", file=sys.stderr)
     pipe.set_progress_bar_config(leave=False)
@@ -119,7 +164,11 @@ def build_pipeline(control_kind):
 
 
 def run_one(pipe, img, control_kind, args, seed):
-    generator = torch.Generator(device=pipe.device).manual_seed(seed)
+    # With enable_model_cpu_offload (SDXL) pipe.device can read back "cpu" even
+    # though generation runs on the GPU -- generate noise on the real compute
+    # device instead of trusting that attribute.
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    generator = torch.Generator(device=device).manual_seed(seed)
     kw = dict(
         prompt=args.prompt,
         negative_prompt=args.negative,
@@ -160,8 +209,12 @@ def build_parser():
     p.add_argument("--outdir", help="directory for batch output")
     p.add_argument("--suffix", default="_art", help="filename suffix for batch output")
 
-    p.add_argument("--control", choices=["lineart", "canny", "none"], default="lineart",
-                   help="how to lock geometry (default: lineart)")
+    p.add_argument("--model", choices=["sd15", "sdxl"], default="sd15",
+                   help="sd15: fast, ~5GB VRAM, lineart or canny. "
+                        "sdxl: sharper/more detail, ~1024px native, canny only, "
+                        "needs CPU-offload on an 8GB card (default: sd15)")
+    p.add_argument("--control", choices=["lineart", "canny", "none"], default=None,
+                   help="how to lock geometry (default: lineart for sd15, canny for sdxl)")
     p.add_argument("--control-scale", type=float, default=0.65,
                    help="ControlNet strength 0..1.5 (higher = more faithful outline, but "
                         "also drags dark/shadowed regions from the source photo's "
@@ -169,11 +222,14 @@ def build_parser():
                         "background comes out too dark/forest-like)")
     p.add_argument("--strength", type=float, default=0.95,
                    help="img2img denoising 0..1 (higher = more restyled, less faithful). "
-                        "Below ~0.8 SD1.5 barely restyles a photo -- it just denoises "
-                        "back toward the original.")
-    p.add_argument("--steps", type=int, default=28)
-    p.add_argument("--guidance", type=float, default=7.5)
-    p.add_argument("--max-size", type=int, default=768, help="long edge in pixels")
+                        "Below ~0.8 these models barely restyle a photo -- they just "
+                        "denoise back toward the original.")
+    p.add_argument("--steps", type=int, default=None,
+                   help="default: 28 for sd15, 32 for sdxl")
+    p.add_argument("--guidance", type=float, default=None,
+                   help="default: 7.5 for sd15, 6.0 for sdxl (SDXL wants lower CFG)")
+    p.add_argument("--max-size", type=int, default=None,
+                   help="long edge in pixels (default: 768 for sd15, 1024 for sdxl)")
     p.add_argument("--seed", type=int, default=-1, help="-1 = random per image")
 
     p.add_argument("--prompt", default=DEFAULT_PROMPT)
@@ -192,14 +248,24 @@ def main():
     if args.extra_prompt:
         args.prompt = f"{args.prompt}, {args.extra_prompt}"
 
+    # per-model defaults for the knobs left unset on the command line
+    if args.control is None:
+        args.control = "canny" if args.model == "sdxl" else "lineart"
+    if args.max_size is None:
+        args.max_size = 1024 if args.model == "sdxl" else 768
+    if args.steps is None:
+        args.steps = 32 if args.model == "sdxl" else 28
+    if args.guidance is None:
+        args.guidance = 6.0 if args.model == "sdxl" else 7.5
+
     inputs = []
     for pattern in args.inputs:
         hits = glob.glob(pattern)
         inputs.extend(sorted(hits) if hits else [pattern])
     outputs = resolve_outputs(inputs, args)
 
-    print(f"loading pipeline (control={args.control}) ...", flush=True)
-    pipe = build_pipeline(args.control)
+    print(f"loading pipeline (model={args.model}, control={args.control}) ...", flush=True)
+    pipe = build_pipeline(args.model, args.control)
 
     for src, dst in zip(inputs, outputs):
         if not os.path.exists(src):
