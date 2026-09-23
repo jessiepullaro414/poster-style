@@ -93,28 +93,36 @@ def load_style_image(path):
     return Image.alpha_composite(bg, img).convert("RGB")
 
 
+def _smooth_for_edges(img):
+    """Bilateral-smooth before edge detection. Canny/lineart on a raw photo
+    pick up the *boundary* of a specular highlight/reflection as a hard edge
+    indistinguishable from a real panel line -- ControlNet then locks that
+    blotchy shape into the output no matter what the prompt says, which is
+    why "no reflections" alone doesn't remove them. This erases soft
+    photographic gradients (reflections, paint sheen) while preserving
+    genuine sharp edges (panel gaps, grille, window frames), so only real
+    structure reaches the edge detector."""
+    import cv2
+
+    arr = np.array(img)
+    arr = cv2.bilateralFilter(arr, d=9, sigmaColor=75, sigmaSpace=75)
+    arr = cv2.bilateralFilter(arr, d=9, sigmaColor=75, sigmaSpace=75)
+    return Image.fromarray(arr)
+
+
 def make_control_image(img, kind):
+    smoothed = _smooth_for_edges(img)
     if kind == "canny":
         import cv2
 
-        # Canny on the raw photo picks up the *boundary* of a specular
-        # highlight/reflection as a hard edge just like a real panel line --
-        # ControlNet then locks that shape into the output no matter what the
-        # prompt says, which is why "no reflections" alone doesn't remove
-        # them. Bilateral-smoothing first erases soft photographic gradients
-        # (reflections, paint sheen) while preserving genuine sharp edges
-        # (panel gaps, grille, window frames), so only the real structure
-        # reaches Canny.
-        smoothed = cv2.bilateralFilter(np.array(img), d=9, sigmaColor=75, sigmaSpace=75)
-        smoothed = cv2.bilateralFilter(smoothed, d=9, sigmaColor=75, sigmaSpace=75)
-        arr = cv2.Canny(smoothed, 100, 200)
+        arr = cv2.Canny(np.array(smoothed), 100, 200)
         arr = np.stack([arr] * 3, axis=-1)
         control = Image.fromarray(arr)
     else:
         from controlnet_aux import LineartDetector
 
         detector = LineartDetector.from_pretrained("lllyasviel/Annotators")
-        control = detector(img, coarse=False)
+        control = detector(smoothed, coarse=False)
 
     # controlnet_aux/cv2 snap to their own resolution grid (multiples of 64) --
     # force an exact match to the img2img latent size or the U-Net add fails.
