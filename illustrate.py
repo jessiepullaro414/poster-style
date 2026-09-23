@@ -84,13 +84,28 @@ def _flatten_onto_white(img):
     return Image.alpha_composite(bg, img).convert("RGB")
 
 
-def cut_out_subject(img):
-    """Remove the background (rembg, local/free) and flatten onto white. Also
-    strips whatever real-world cast shadow was in the photo -- it's part of
-    the background, not the subject, so it goes with it."""
+def cut_out_subject(img, pad_frac=0.06):
+    """Remove the background (rembg, local/free), crop tight to the subject
+    with a small margin, and flatten onto white. Also strips whatever
+    real-world cast shadow was in the photo -- it's part of the background,
+    not the subject, so it goes with it.
+
+    The crop matters on its own: skip it and a photo where the car is a
+    small part of the frame (lots of sky/grass/driveway around it, like a
+    landscape product shot) leaves the isolated subject tiny in a mostly
+    empty canvas -- wasted resolution and a bad composition."""
     from rembg import remove
 
-    return _flatten_onto_white(remove(img))
+    cut = remove(img).convert("RGBA")
+    bbox = cut.split()[-1].getbbox()  # bounding box of the non-transparent pixels
+    if bbox:
+        w, h = cut.size
+        x0, y0, x1, y1 = bbox
+        pad_x, pad_y = round((x1 - x0) * pad_frac), round((y1 - y0) * pad_frac)
+        x0, y0 = max(0, x0 - pad_x), max(0, y0 - pad_y)
+        x1, y1 = min(w, x1 + pad_x), min(h, y1 + pad_y)
+        cut = cut.crop((x0, y0, x1, y1))
+    return _flatten_onto_white(cut)
 
 
 def load_resized(path, max_size, remove_bg=False):
@@ -114,13 +129,19 @@ def load_style_image(path):
 def apply_pastel(pil_img):
     """Post-process color grade toward a soft/pastel palette -- the model's own
     color choices tend to run more saturated than a poster illustration wants.
-    Reuses posterize.py's grade() (saturation down, blacks lifted, slight warm
-    tint) rather than re-rolling generations to chase color taste."""
+    Reuses posterize.py's grade() (saturation down, slight warm tint) rather
+    than re-rolling generations to chase color taste.
+
+    Keep `lift` small: grade()'s black-lift is a flat additive floor (f = lift
+    + (1-lift)*f), so a bigger value turns a *dark* car's paint visibly grey
+    or brown right along with lightening genuine shadows -- tested against a
+    black car; 0.13 (tuned only against a pale car) washed it out to tan,
+    0.04 keeps black recognizably black while still softening the rest."""
     import cv2
     from posterize import grade
 
     bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-    graded = grade(bgr, saturation=0.62, warmth=0.05, lift=0.13, gamma=0.97, contrast=0.9)
+    graded = grade(bgr, saturation=0.7, warmth=0.02, lift=0.04, gamma=0.98, contrast=0.95)
     return Image.fromarray(cv2.cvtColor(graded, cv2.COLOR_BGR2RGB))
 
 
