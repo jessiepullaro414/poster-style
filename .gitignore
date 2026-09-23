@@ -8,3 +8,6 @@ models/
 # scratch test images
 sample_in.png
 sample_out.png
+
+__pycache__/
+*.pyc

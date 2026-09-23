@@ -51,16 +51,22 @@ CONTROLNETS = {
     },
 }
 SDXL_VAE_FIX = "madebyollin/sdxl-vae-fp16-fix"  # avoids NaN/black frames in fp16
+IP_ADAPTER_REPO = "h94/IP-Adapter"
+IP_ADAPTER_WEIGHTS = {
+    "sd15": ("models", "ip-adapter_sd15.bin"),
+    "sdxl": ("sdxl_models", "ip-adapter_sdxl.bin"),
+}
 
 DEFAULT_PROMPT = (
     "flat editorial illustration, minimalist vector art style, smooth cel shading, "
-    "clean flat color shapes, muted pastel palette, soft even daylight, matte finish, "
-    "subtle canvas texture, modern poster art, crisp linework"
+    "solid flat color shapes with no reflections, muted pastel palette, soft even "
+    "daylight, matte finish, modern poster art, crisp linework"
 )
 DEFAULT_NEGATIVE = (
     "photograph, photorealistic, 3d render, hdr, film grain, noise, jpeg artifacts, "
-    "dark background, black foliage, night, dim, dense dark forest, harsh shadow, "
-    "high contrast, harsh specular highlights, oversaturated, text, watermark, signature, blurry, "
+    "glossy, reflective, specular highlight, shiny paint reflection, glare, chrome "
+    "shine, dark background, black foliage, night, dim, dense dark forest, harsh "
+    "shadow, high contrast, oversaturated, text, watermark, signature, blurry, "
     "deformed, wrong proportions, extra wheels, extra lights"
 )
 
@@ -78,11 +84,30 @@ def load_resized(path, max_size):
     return img.resize((nw, nh), Image.LANCZOS)
 
 
+def load_style_image(path):
+    """Open a reference image for IP-Adapter -- flatten transparency onto white
+    first (a background-removed PNG's RGB under a transparent pixel is
+    undefined and can come back black, which would poison the CLIP embedding)."""
+    img = Image.open(path).convert("RGBA")
+    bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
+    return Image.alpha_composite(bg, img).convert("RGB")
+
+
 def make_control_image(img, kind):
     if kind == "canny":
         import cv2
 
-        arr = cv2.Canny(np.array(img), 100, 200)
+        # Canny on the raw photo picks up the *boundary* of a specular
+        # highlight/reflection as a hard edge just like a real panel line --
+        # ControlNet then locks that shape into the output no matter what the
+        # prompt says, which is why "no reflections" alone doesn't remove
+        # them. Bilateral-smoothing first erases soft photographic gradients
+        # (reflections, paint sheen) while preserving genuine sharp edges
+        # (panel gaps, grille, window frames), so only the real structure
+        # reaches Canny.
+        smoothed = cv2.bilateralFilter(np.array(img), d=9, sigmaColor=75, sigmaSpace=75)
+        smoothed = cv2.bilateralFilter(smoothed, d=9, sigmaColor=75, sigmaSpace=75)
+        arr = cv2.Canny(smoothed, 100, 200)
         arr = np.stack([arr] * 3, axis=-1)
         control = Image.fromarray(arr)
     else:
@@ -101,7 +126,7 @@ def make_control_image(img, kind):
 # --------------------------------------------------------------------------- #
 # pipeline
 # --------------------------------------------------------------------------- #
-def build_pipeline(model, control_kind):
+def build_pipeline(model, control_kind, use_style=False, style_strength=0.6):
     import diffusers
 
     if control_kind != "none" and control_kind not in CONTROLNETS[model]:
@@ -143,6 +168,15 @@ def build_pipeline(model, control_kind):
             )
 
     pipe.scheduler = diffusers.UniPCMultistepScheduler.from_config(pipe.scheduler.config)
+
+    if use_style:
+        # Must happen before .to(cuda)/enable_model_cpu_offload -- offload's
+        # device hooks are registered against the components present at that
+        # point, and the IP-Adapter's image encoder needs to be one of them.
+        subfolder, weight_name = IP_ADAPTER_WEIGHTS[model]
+        pipe.load_ip_adapter(IP_ADAPTER_REPO, subfolder=subfolder, weight_name=weight_name)
+        pipe.set_ip_adapter_scale(style_strength)
+
     if cuda:
         if hasattr(pipe, "enable_attention_slicing"):
             pipe.enable_attention_slicing()
@@ -159,11 +193,12 @@ def build_pipeline(model, control_kind):
             pipe.to("cuda")
     else:
         print("no CUDA -- running on CPU, expect minutes per image", file=sys.stderr)
+
     pipe.set_progress_bar_config(leave=False)
     return pipe
 
 
-def run_one(pipe, img, control_kind, args, seed):
+def run_one(pipe, img, control_kind, args, seed, style_image=None):
     # With enable_model_cpu_offload (SDXL) pipe.device can read back "cpu" even
     # though generation runs on the GPU -- generate noise on the real compute
     # device instead of trusting that attribute.
@@ -181,6 +216,8 @@ def run_one(pipe, img, control_kind, args, seed):
     if control_kind != "none":
         kw["control_image"] = make_control_image(img, control_kind)
         kw["controlnet_conditioning_scale"] = args.control_scale
+    if style_image is not None:
+        kw["ip_adapter_image"] = style_image
     return pipe(**kw).images[0]
 
 
@@ -230,6 +267,16 @@ def build_parser():
                    help="default: 7.5 for sd15, 6.0 for sdxl (SDXL wants lower CFG)")
     p.add_argument("--max-size", type=int, default=None,
                    help="long edge in pixels (default: 768 for sd15, 1024 for sdxl)")
+
+    p.add_argument("--style-image",
+                   help="reference image (IP-Adapter) whose look gets blended in on "
+                        "top of the text prompt -- much stronger pull toward matching "
+                        "a specific target image than prompt wording alone. A "
+                        "background-removed / isolated-subject crop works best since "
+                        "its background won't compete with the prompt's.")
+    p.add_argument("--style-strength", type=float, default=0.6,
+                   help="IP-Adapter weight 0..1 -- how hard --style-image pulls "
+                        "vs. the text prompt (default 0.6)")
     p.add_argument("--seed", type=int, default=-1, help="-1 = random per image")
 
     p.add_argument("--prompt", default=DEFAULT_PROMPT)
@@ -264,8 +311,31 @@ def main():
         inputs.extend(sorted(hits) if hits else [pattern])
     outputs = resolve_outputs(inputs, args)
 
-    print(f"loading pipeline (model={args.model}, control={args.control}) ...", flush=True)
-    pipe = build_pipeline(args.model, args.control)
+    style_image = load_style_image(args.style_image) if args.style_image else None
+    if style_image is not None:
+        # Confirmed broken in this venv (diffusers 0.40.0 + transformers 5.17.0):
+        # load_ip_adapter() patches pipe.unet's attention processors, but its
+        # image-embedding path hits `encoder_hidden_states.shape` on what comes
+        # back as a plain tuple -- reproduces identically with or without
+        # ControlNet, so it's not a ControlNet interaction. diffusers 0.40.0 is
+        # still the latest release (no fix yet), and transformers can't be
+        # downgraded to the 4.x line diffusers' IP-Adapter code targets without
+        # cascading into incompatible tokenizers/huggingface-hub pins in this
+        # stack. Fail fast here instead of burning 10+ GPU-minutes on a crash --
+        # delete this guard once a compatible diffusers/transformers pair exists.
+        sys.exit(
+            "--style-image (IP-Adapter) doesn't work in this venv right now: "
+            "diffusers 0.40.0's IP-Adapter code is incompatible with "
+            "transformers 5.x here (AttributeError: 'tuple' object has no "
+            "attribute 'shape'), and there's no newer diffusers release to "
+            "pull. See the comment above this check in illustrate.py."
+        )
+
+    print(f"loading pipeline (model={args.model}, control={args.control}, "
+          f"style={'yes' if style_image else 'no'}) ...", flush=True)
+    pipe = build_pipeline(args.model, args.control,
+                           use_style=style_image is not None,
+                           style_strength=args.style_strength)
 
     for src, dst in zip(inputs, outputs):
         if not os.path.exists(src):
@@ -274,7 +344,7 @@ def main():
         seed = torch.seed() % (2**31) if args.seed < 0 else args.seed
         img = load_resized(src, args.max_size)
         print(f"{src}  {img.size}  seed={seed}", flush=True)
-        result = run_one(pipe, img, args.control, args, seed)
+        result = run_one(pipe, img, args.control, args, seed, style_image=style_image)
         os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
         result.save(dst)
         print(f"  -> {dst}", flush=True)
