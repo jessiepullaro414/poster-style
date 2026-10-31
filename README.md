@@ -126,3 +126,44 @@ back toward photoreal) + `--pastel` (SD1.5's raw color choices ran punchier
 than a poster wants) + a specific `--extra-prompt` describing the subject's
 actual colors and details + a seed that happened to land on the right wheel
 color (`--seed 23` here -- there's no shortcut for this part, roll a few).
+
+## Running on the garage PC (CPU only)
+
+The Beelink at the workbench (Ryzen 7 7735U, 8 cores, Radeon iGPU -- no CUDA)
+runs `illustrate.py` on its CPU at `C:\Users\Garage\poster-style`. Slow, but
+it's always on, so the laptop doesn't have to be.
+
+Setup there: Python 3.13 (`winget install Python.Python.3.13 --scope user`),
+then a `.venv` with CPU-only wheels (no 2.5 GB CUDA build needed):
+
+```bash
+pip install --extra-index-url https://download.pytorch.org/whl/cpu torch==2.9.1+cpu torchvision==0.24.1+cpu diffusers==0.40.0 transformers==5.17.0 tokenizers==0.23.2 accelerate==1.15.0 safetensors controlnet_aux==0.0.10 opencv-python numpy pillow rembg==2.0.85 onnxruntime==1.30.0
+```
+
+Models were copied over the LAN from the main PC rather than re-downloaded:
+SD 1.5, the lineart ControlNet and the annotators into `models/hub`, and the
+rembg models (`bria-rmbg`, `isnet-general-use`) into `~\.rembg\models`. SDXL
+isn't there -- on this CPU it would take well over an hour per image.
+
+Run through `garage_run.ps1`, which starts the worker at below-normal priority
+(so the wall-screen dashboard keeps the CPU when it needs it) and prints wall
+time + peak memory. From the main PC:
+
+```bash
+tar -cf - photo.jpg | ssh garage@192.168.1.110 'tar -xf - -C C:\Users\Garage\poster-style'
+ssh garage@192.168.1.110 'powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\Garage\poster-style\garage_run.ps1 -In C:\Users\Garage\poster-style\photo.jpg -Out C:\Users\Garage\poster-style\photo_art.png -Prompt "subject description"'
+ssh garage@192.168.1.110 'tar -cf - -C C:\Users\Garage\poster-style photo_art.png' | tar -xf -
+```
+
+Measured (reference Alfa photo, SD 1.5, `--remove-bg --pastel`, 26 steps):
+**377 s per image** (11.5 s/step + ~75 s loading/cutout), **9.5 GB peak
+private memory**. The same seed gives a different image than on the GPU (CPU
+and CUDA generate different noise) but is reproducible run to run here.
+
+Memory, measured phase by phase: background removal was the peak (BRIA
+RMBG-2.0 hit 10.5 GB, more than the whole diffusion pipeline). Fixed by doing
+every cutout before the pipeline loads, through one shared session, and turning
+off ONNX Runtime's CPU memory arena (10.45 -> 7.77 GB for the cutout step).
+`--bg-model isnet-general-use` drops that step to 1.7 GB / 6 s, with slightly
+soft edges where the tires meet the ground. Attention slicing and VAE tiling
+made no difference on CPU, so they stay GPU-only.

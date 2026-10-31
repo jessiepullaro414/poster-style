@@ -11,3 +11,7 @@ sample_out.png
 
 __pycache__/
 *.pyc
+
+# garage_run.ps1's per-run stdout/stderr
+run.log
+run.err

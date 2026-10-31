@@ -84,7 +84,7 @@ def _flatten_onto_white(img):
     return Image.alpha_composite(bg, img).convert("RGB")
 
 
-def cut_out_subject(img, pad_frac=0.06):
+def cut_out_subject(img, pad_frac=0.06, session=None):
     """Remove the background (rembg, local/free), crop tight to the subject
     with a small margin, and flatten onto white. Also strips whatever
     real-world cast shadow was in the photo -- it's part of the background,
@@ -96,7 +96,7 @@ def cut_out_subject(img, pad_frac=0.06):
     empty canvas -- wasted resolution and a bad composition."""
     from rembg import remove
 
-    cut = remove(img).convert("RGBA")
+    cut = remove(img, session=session).convert("RGBA")
     bbox = cut.split()[-1].getbbox()  # bounding box of the non-transparent pixels
     if bbox:
         w, h = cut.size
@@ -108,12 +108,12 @@ def cut_out_subject(img, pad_frac=0.06):
     return _flatten_onto_white(cut)
 
 
-def load_resized(path, max_size, remove_bg=False):
+def load_resized(path, max_size, remove_bg=False, session=None):
     """Open RGB (optionally background-removed) and scale so the long edge ==
     max_size, both edges multiples of 8."""
     img = Image.open(path).convert("RGB")
     if remove_bg:
-        img = cut_out_subject(img)
+        img = cut_out_subject(img, session=session)
     w, h = img.size
     scale = max_size / max(w, h)
     nw, nh = (max(64, round(w * scale)), max(64, round(h * scale)))
@@ -238,6 +238,11 @@ def build_pipeline(model, control_kind, use_style=False, style_strength=0.6):
         pipe.set_ip_adapter_scale(style_strength)
 
     if cuda:
+        # GPU-only on purpose: on CPU, attention slicing + VAE tiling measured
+        # no change in peak private memory (9.68 vs 9.66 GB, garage PC) and ~8%
+        # slower. (Note hasattr(pipe, "enable_vae_tiling") is False for the
+        # ControlNet img2img pipelines -- tiling lives on pipe.vae -- so that
+        # line has never actually enabled tiling.)
         if hasattr(pipe, "enable_attention_slicing"):
             pipe.enable_attention_slicing()
         if hasattr(pipe, "enable_vae_tiling"):
@@ -336,6 +341,12 @@ def build_parser():
                         "flat background, minimal soft shadow' to the prompt so the "
                         "model doesn't try to reconstruct a photoreal scene.")
 
+    p.add_argument("--bg-model", default="bria-rmbg",
+                   help="rembg model for --remove-bg. bria-rmbg (default): crispest "
+                        "edges, ~7.8 GB / ~40 s on the garage PC's CPU. "
+                        "isnet-general-use: ~1.7 GB / ~6 s, slightly soft edges "
+                        "where tires meet the ground.")
+
     p.add_argument("--style-image",
                    help="reference image (IP-Adapter) whose look gets blended in on "
                         "top of the text prompt -- much stronger pull toward matching "
@@ -408,18 +419,41 @@ def main():
             "pull. See the comment above this check in illustrate.py."
         )
 
+    # Prepare every input -- including all background cutouts, through one
+    # shared rembg session -- BEFORE loading the diffusion pipeline, then free
+    # the segmentation model. Done the other way round, both models sat in RAM
+    # together: measured 9.0 GB peak on the CPU-only garage PC.
+    session = None
+    if args.remove_bg:
+        import onnxruntime as ort
+        from rembg import new_session
+
+        # ORT's CPU memory arena grows to the inference peak and never gives
+        # it back: BRIA RMBG-2.0 measured 10.45 GB peak private with it, 7.77
+        # GB without (garage PC, same image, same speed within noise).
+        so = ort.SessionOptions()
+        so.enable_cpu_mem_arena = False
+        session = new_session(args.bg_model, sess_opts=so)
+    jobs = []
+    for src, dst in zip(inputs, outputs):
+        if not os.path.exists(src):
+            print(f"skip (missing): {src}", file=sys.stderr)
+            continue
+        jobs.append((src, dst, load_resized(src, args.max_size, args.remove_bg, session)))
+    if session is not None:
+        del session
+        import gc
+
+        gc.collect()
+
     print(f"loading pipeline (model={args.model}, control={args.control}, "
           f"style={'yes' if style_image else 'no'}) ...", flush=True)
     pipe = build_pipeline(args.model, args.control,
                            use_style=style_image is not None,
                            style_strength=args.style_strength)
 
-    for src, dst in zip(inputs, outputs):
-        if not os.path.exists(src):
-            print(f"skip (missing): {src}", file=sys.stderr)
-            continue
+    for src, dst, img in jobs:
         seed = torch.seed() % (2**31) if args.seed < 0 else args.seed
-        img = load_resized(src, args.max_size, remove_bg=args.remove_bg)
         print(f"{src}  {img.size}  seed={seed}", flush=True)
         result = run_one(pipe, img, args.control, args, seed, style_image=style_image)
         if args.pastel:
